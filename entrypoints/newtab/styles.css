@@ -47,7 +47,6 @@ select {
 }
 
 .screen > :not(.screen-background) {
-  position: relative;
   z-index: 1;
 }
 
@@ -76,6 +75,7 @@ select {
 }
 
 .top-area {
+  position: relative;
   display: grid;
   justify-items: center;
   gap: 10px;
@@ -110,6 +110,7 @@ select {
 }
 
 .links-area {
+  position: relative;
   width: min(1280px, calc(100vw - 48px));
   margin: 0 auto;
   min-height: 0;
@@ -315,8 +316,9 @@ select {
 
 .settings-trigger {
   position: fixed;
-  right: 22px;
-  bottom: 20px;
+  left: auto;
+  right: max(22px, env(safe-area-inset-right));
+  bottom: max(20px, env(safe-area-inset-bottom));
   width: 44px;
   height: 44px;
   border-radius: 999px;
