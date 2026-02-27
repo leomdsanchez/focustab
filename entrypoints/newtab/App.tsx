@@ -4,11 +4,14 @@ import {
   useCallback,
   useRef,
   useState,
+  type CSSProperties,
   type FormEvent,
+  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
   ArrowLeft,
+  ArrowUpDown,
   Bot,
   CalendarDays,
   ChevronRight,
@@ -16,13 +19,17 @@ import {
   Folder,
   Github,
   Globe,
+  GripVertical,
   Grid3x3,
   Linkedin,
   Link2,
   Mail,
   MessageCircle,
+  MoreVertical,
   Palette,
+  Pencil,
   Plus,
+  RefreshCw,
   Settings,
   Trash2,
   Twitter,
@@ -31,9 +38,11 @@ import {
 } from 'lucide-react';
 import {
   DEFAULT_SETTINGS,
+  getFaviconPrefs,
   getLinks,
   getSettings,
   sanitizeUrl,
+  saveFaviconPrefs,
   saveLinks,
   saveSettings,
   type AppSettings,
@@ -48,6 +57,15 @@ interface LinkDraft {
   name: string;
   url: string;
   icon: LinkIconKey;
+  useSiteFavicon: boolean;
+}
+
+type AddFlowStep = 'url' | 'name' | 'favicon' | 'icon';
+
+interface GridContextMenuState {
+  linkId: string;
+  x: number;
+  y: number;
 }
 
 const ICON_BY_KEY: Record<LinkIconKey, LucideIcon> = {
@@ -137,9 +155,126 @@ function getHostname(url: string) {
   }
 }
 
-function getFaviconUrl(url: string) {
-  const hostname = getHostname(url);
-  return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=128`;
+function getFaviconCandidates(url: string) {
+  const sanitized = sanitizeUrl(url) ?? url;
+  const hostname = getHostname(sanitized);
+  let origin = '';
+  try {
+    origin = new URL(sanitized).origin;
+  } catch {
+    origin = `https://${hostname}`;
+  }
+
+  const candidates = [
+    `${origin}/favicon.ico`,
+    `${origin}/favicon.png`,
+    `${origin}/favicon.svg`,
+    `${origin}/apple-touch-icon.png`,
+    `${origin}/vite.svg`,
+    `https://www.google.com/s2/favicons?sz=256&domain_url=${encodeURIComponent(sanitized)}`,
+    `https://t0.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=${encodeURIComponent(sanitized)}&size=256`,
+    `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=128`,
+    `https://icons.duckduckgo.com/ip3/${hostname}.ico`,
+  ];
+
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function getRenderableFaviconCandidates(url: string, preferredFaviconUrl?: string) {
+  const base = getFaviconCandidates(url);
+  const preferred = preferredFaviconUrl?.trim();
+  if (!preferred) {
+    return base;
+  }
+
+  return Array.from(new Set([preferred, ...base]));
+}
+
+function withCacheBuster(url: string, refreshKey: number, attempt: number) {
+  if (refreshKey <= 0) {
+    return url;
+  }
+  return `${url}${url.includes('?') ? '&' : '?'}v=${refreshKey}-${attempt}`;
+}
+
+function scoreFaviconCandidate(url: string, width: number, height: number, targetHostname: string) {
+  const isSvg = /\.svg(\?|$)/i.test(url);
+  const safeWidth = width > 0 ? width : isSvg ? 64 : 0;
+  const safeHeight = height > 0 ? height : isSvg ? 64 : 0;
+
+  if (safeWidth < 12 || safeHeight < 12) {
+    return -1000;
+  }
+
+  const min = Math.min(safeWidth, safeHeight);
+  const max = Math.max(safeWidth, safeHeight);
+  const ratio = min / max;
+  let score = min * 2 + ratio * 40;
+
+  const candidateHostname = getHostname(url);
+  const sameDomain =
+    candidateHostname === targetHostname ||
+    candidateHostname.endsWith(`.${targetHostname}`) ||
+    targetHostname.endsWith(`.${candidateHostname}`);
+
+  if (sameDomain) {
+    score += 90;
+  }
+  if (/favicon(\.|-|$)/i.test(url)) {
+    score += 16;
+  }
+  if (/apple-touch-icon|icon-192|icon-512|maskable/i.test(url)) {
+    score += 18;
+  }
+  if (/vite\.svg(\?|$)/i.test(url)) {
+    score += 12;
+  }
+  if (isSvg) {
+    score += 6;
+  }
+  if (/google\.com\/s2\/favicons/i.test(url) && /[?&]domain_url=/i.test(url)) {
+    score += 24;
+  }
+  if (/gstatic\.com\/faviconV2/i.test(url) && /[?&]url=/i.test(url)) {
+    score += 24;
+  }
+  if (/google\.com\/s2\/favicons/i.test(url) && /[?&]domain=/i.test(url)) {
+    score -= 20;
+  }
+  if (/google\.com\/s2|duckduckgo\.com\/ip3/i.test(url)) {
+    score -= 70;
+  }
+  if (/favicon\.ico(\?|$)/i.test(url)) {
+    score -= 4;
+  }
+
+  return score;
+}
+
+function loadImageDimensions(url: string, timeoutMs = 2500) {
+  return new Promise<{ ok: boolean; width: number; height: number }>((resolve) => {
+    const image = new Image();
+    let done = false;
+
+    const finish = (ok: boolean, width = 0, height = 0) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      window.clearTimeout(timer);
+      resolve({ ok, width, height });
+    };
+
+    const timer = window.setTimeout(() => finish(false), timeoutMs);
+    image.onload = () => finish(true, image.naturalWidth || 0, image.naturalHeight || 0);
+    image.onerror = () => finish(false);
+    image.referrerPolicy = 'no-referrer';
+    image.src = url;
+  });
+}
+
+function isLowQualityGoogleDomainFavicon(url: string) {
+  return /google\.com\/s2\/favicons/i.test(url) && /[?&]domain=/.test(url) && !/[?&]domain_url=/.test(url);
 }
 
 function parseClipboardLink(raw: string): { url: string; name?: string } | null {
@@ -193,6 +328,43 @@ function chunkByRows<T>(items: T[], rowsPerColumn: number) {
   return columns;
 }
 
+const RECENT_ACCESS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function pruneRecentAccessLog(accessLog: number[], nowTs: number) {
+  const minTs = nowTs - RECENT_ACCESS_WINDOW_MS;
+  return accessLog.filter((value) => Number.isFinite(value) && value >= minTs && value <= nowTs + 60_000);
+}
+
+function getRecentAccessCount(link: QuickLink, nowTs: number) {
+  return pruneRecentAccessLog(link.accessLog, nowTs).length;
+}
+
+function orderLinksByMode(links: QuickLink[], mode: AppSettings['linksSortMode'], nowTs: number) {
+  if (mode === 'most_accessed') {
+    return [...links].sort(
+      (a, b) =>
+        getRecentAccessCount(b, nowTs) - getRecentAccessCount(a, nowTs) ||
+        a.order - b.order ||
+        a.createdAt - b.createdAt,
+    );
+  }
+
+  return [...links].sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+}
+
+function reorderById(items: QuickLink[], draggedId: string, targetId: string) {
+  const fromIndex = items.findIndex((item) => item.id === draggedId);
+  const toIndex = items.findIndex((item) => item.id === targetId);
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+    return items;
+  }
+
+  const next = [...items];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  return next;
+}
+
 export default function App() {
   const [now, setNow] = useState(() => new Date());
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
@@ -201,15 +373,36 @@ export default function App() {
   const [settingsView, setSettingsView] = useState<SettingsView>('menu');
   const [showSettingsTrigger, setShowSettingsTrigger] = useState(false);
   const [query, setQuery] = useState('');
-  const [failedFavicons, setFailedFavicons] = useState<Record<string, true>>({});
+  const [faviconFallbackOffsetByLink, setFaviconFallbackOffsetByLink] = useState<Record<string, number>>({});
+  const [faviconChoiceByLink, setFaviconChoiceByLink] = useState<Record<string, string>>({});
+  const [faviconRefreshKey, setFaviconRefreshKey] = useState(0);
+  const [faviconRefreshState, setFaviconRefreshState] = useState<'idle' | 'loading' | 'done'>(
+    'idle',
+  );
+  const [faviconRefreshProgress, setFaviconRefreshProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [linkDraft, setLinkDraft] = useState<LinkDraft>({
     name: '',
     url: '',
     icon: 'globe',
+    useSiteFavicon: true,
   });
   const [linkFormError, setLinkFormError] = useState('');
+  const [draggedLinkId, setDraggedLinkId] = useState<string | null>(null);
+  const [linksPanelMode, setLinksPanelMode] = useState<'overview' | 'add' | 'manage'>('overview');
+  const [addFlowStep, setAddFlowStep] = useState<AddFlowStep>('url');
+  const [editingLinkId, setEditingLinkId] = useState<string | null>(null);
+  const [openLinkMenuId, setOpenLinkMenuId] = useState<string | null>(null);
+  const [pendingDeleteLinkId, setPendingDeleteLinkId] = useState<string | null>(null);
+  const [gridContextMenu, setGridContextMenu] = useState<GridContextMenuState | null>(null);
 
   const queryTimerRef = useRef<number | null>(null);
+  const faviconFeedbackTimerRef = useRef<number | null>(null);
+  const deleteConfirmTimerRef = useRef<number | null>(null);
+  const linkMenuRootRef = useRef<HTMLDivElement | null>(null);
+  const gridContextMenuRef = useRef<HTMLDivElement | null>(null);
   const linksViewportRef = useRef<HTMLDivElement | null>(null);
   const scrollTargetRef = useRef(0);
   const scrollRafRef = useRef<number | null>(null);
@@ -229,19 +422,166 @@ export default function App() {
     let mounted = true;
 
     void (async () => {
-      const [savedSettings, savedLinks] = await Promise.all([getSettings(), getLinks()]);
+      const [savedSettings, savedLinks, savedFaviconPrefs] = await Promise.all([
+        getSettings(),
+        getLinks(),
+        getFaviconPrefs(),
+      ]);
       if (!mounted) {
         return;
       }
 
+      const sanitizedFaviconPrefs = Object.fromEntries(
+        Object.entries(savedFaviconPrefs).filter(([, value]) => !isLowQualityGoogleDomainFavicon(value)),
+      );
+
       setSettings(savedSettings);
       setLinks(savedLinks);
+      setFaviconChoiceByLink(sanitizedFaviconPrefs);
+      if (Object.keys(sanitizedFaviconPrefs).length !== Object.keys(savedFaviconPrefs).length) {
+        void saveFaviconPrefs(sanitizedFaviconPrefs);
+      }
     })();
 
     return () => {
       mounted = false;
     };
   }, []);
+
+  useEffect(
+    () => () => {
+      if (faviconFeedbackTimerRef.current !== null) {
+        window.clearTimeout(faviconFeedbackTimerRef.current);
+      }
+      if (deleteConfirmTimerRef.current !== null) {
+        window.clearTimeout(deleteConfirmTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (deleteConfirmTimerRef.current !== null) {
+      window.clearTimeout(deleteConfirmTimerRef.current);
+      deleteConfirmTimerRef.current = null;
+    }
+
+    if (!pendingDeleteLinkId) {
+      return;
+    }
+
+    deleteConfirmTimerRef.current = window.setTimeout(() => {
+      setPendingDeleteLinkId((current) => (current === pendingDeleteLinkId ? null : current));
+      deleteConfirmTimerRef.current = null;
+    }, 2000);
+  }, [pendingDeleteLinkId]);
+
+  useEffect(() => {
+    if (!openLinkMenuId) {
+      return;
+    }
+
+    const onMouseMove = (event: MouseEvent) => {
+      const root = linkMenuRootRef.current;
+      if (!root) {
+        return;
+      }
+
+      const rect = root.getBoundingClientRect();
+      const dx =
+        event.clientX < rect.left
+          ? rect.left - event.clientX
+          : event.clientX > rect.right
+            ? event.clientX - rect.right
+            : 0;
+      const dy =
+        event.clientY < rect.top
+          ? rect.top - event.clientY
+          : event.clientY > rect.bottom
+            ? event.clientY - rect.bottom
+            : 0;
+
+      if (Math.hypot(dx, dy) > 120) {
+        setOpenLinkMenuId(null);
+        setPendingDeleteLinkId(null);
+      }
+    };
+
+    const onMouseDown = (event: MouseEvent) => {
+      const root = linkMenuRootRef.current;
+      if (!root || !(event.target instanceof Node)) {
+        return;
+      }
+
+      if (!root.contains(event.target)) {
+        setOpenLinkMenuId(null);
+        setPendingDeleteLinkId(null);
+      }
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mousedown', onMouseDown);
+
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mousedown', onMouseDown);
+    };
+  }, [openLinkMenuId]);
+
+  useEffect(() => {
+    if (!gridContextMenu) {
+      return;
+    }
+
+    const onPointerDown = (event: MouseEvent) => {
+      const menu = gridContextMenuRef.current;
+      if (!menu || !(event.target instanceof Node)) {
+        return;
+      }
+
+      if (!menu.contains(event.target)) {
+        setGridContextMenu(null);
+      }
+    };
+
+    const onGlobalContext = (event: MouseEvent) => {
+      const menu = gridContextMenuRef.current;
+      if (!menu || !(event.target instanceof Node)) {
+        return;
+      }
+
+      if (!menu.contains(event.target)) {
+        setGridContextMenu(null);
+      }
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setGridContextMenu(null);
+      }
+    };
+
+    const close = () => setGridContextMenu(null);
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('contextmenu', onGlobalContext);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('wheel', close, { passive: true });
+    window.addEventListener('resize', close);
+
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('contextmenu', onGlobalContext);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('wheel', close);
+      window.removeEventListener('resize', close);
+    };
+  }, [gridContextMenu]);
+
+  useEffect(() => {
+    if (settingsOpen) {
+      setGridContextMenu(null);
+    }
+  }, [settingsOpen]);
 
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
@@ -260,7 +600,7 @@ export default function App() {
           void navigator.clipboard
             .readText()
             .then((text) => {
-              void addLinkFromClipboardRaw(text);
+              startAddFlowFromRaw(text, true);
             })
             .catch(() => {
               // Ignore clipboard permission errors.
@@ -285,6 +625,39 @@ export default function App() {
       }
 
       if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+
+      if (event.key === 'Enter') {
+        const queryNormalized = normalizeText(query.trim());
+        const orderedForLookup = orderLinksByMode(
+          links,
+          settings.linksSortMode ?? DEFAULT_SETTINGS.linksSortMode,
+          now.getTime(),
+        );
+        const topMatch =
+          queryNormalized.length > 0
+            ? orderedForLookup.find((link) => {
+                const searchable = `${link.name} ${getHostname(link.url)} ${link.tags.join(' ')}`;
+                return normalizeText(searchable).includes(queryNormalized);
+              })
+            : null;
+        if (query.trim() && topMatch) {
+          event.preventDefault();
+          void onOpenLink(topMatch);
+          return;
+        }
+
+        const queryAsUrl = sanitizeUrl(query.trim());
+        if (query.trim() && queryAsUrl) {
+          event.preventDefault();
+          openAddLinkFlow({
+            initialUrl: queryAsUrl,
+            initialName: '',
+            skipUrlStep: true,
+          });
+          setQuery('');
+        }
         return;
       }
 
@@ -325,7 +698,7 @@ export default function App() {
       }
 
       event.preventDefault();
-      void addLinkFromClipboardRaw(text);
+      startAddFlowFromRaw(text, true);
     };
 
     window.addEventListener('mousemove', onMouseMove);
@@ -340,25 +713,43 @@ export default function App() {
         window.clearTimeout(queryTimerRef.current);
       }
     };
-  }, [settingsOpen, links]);
+  }, [settingsOpen, links, query, settings.linksSortMode, now]);
 
   const clockText = useMemo(() => getTimeLabel(now, settings), [now, settings]);
+
+  const displayLinks = useMemo(
+    () =>
+      orderLinksByMode(links, settings.linksSortMode ?? DEFAULT_SETTINGS.linksSortMode, now.getTime()),
+    [links, settings.linksSortMode, now],
+  );
 
   const filteredLinks = useMemo(() => {
     const queryNormalized = normalizeText(query.trim());
     if (!queryNormalized) {
-      return links;
+      return displayLinks;
     }
 
-    return links.filter((link) => {
+    return displayLinks.filter((link) => {
       const searchable = `${link.name} ${getHostname(link.url)} ${link.tags.join(' ')}`;
       return normalizeText(searchable).includes(queryNormalized);
     });
-  }, [links, query]);
+  }, [displayLinks, query]);
+
+  useEffect(() => {
+    const validIds = new Set(links.map((link) => link.id));
+    const entries = Object.entries(faviconChoiceByLink).filter(([linkId]) => validIds.has(linkId));
+    if (entries.length === Object.keys(faviconChoiceByLink).length) {
+      return;
+    }
+
+    const pruned = Object.fromEntries(entries);
+    void persistFaviconChoices(pruned);
+  }, [links, faviconChoiceByLink]);
 
   const safeGridRows = toSafeInt(settings.gridRows, 1, 8, DEFAULT_SETTINGS.gridRows);
   const safeGridCols = toSafeInt(settings.gridCols, 1, 12, DEFAULT_SETTINGS.gridCols);
   const safeIconSize = toSafeInt(settings.iconSize, 40, 140, DEFAULT_SETTINGS.iconSize);
+  const safeClockScale = toSafeInt(settings.clockScale, 60, 150, DEFAULT_SETTINGS.clockScale);
 
   const linkColumns = useMemo(
     () => chunkByRows(filteredLinks, safeGridRows),
@@ -689,44 +1080,204 @@ export default function App() {
     setLinks(saved);
   }
 
-  function markFaviconFailure(linkId: string) {
-    setFailedFavicons((current) => {
-      if (current[linkId]) {
+  async function persistFaviconChoices(nextChoices: Record<string, string>) {
+    const saved = await saveFaviconPrefs(nextChoices);
+    setFaviconChoiceByLink(saved);
+  }
+
+  function onFaviconError(linkId: string, candidateCount: number) {
+    setFaviconFallbackOffsetByLink((current) => {
+      const currentOffset = current[linkId] ?? 0;
+      const maxOffset = Math.max(0, candidateCount - 1);
+      const nextOffset = Math.min(currentOffset + 1, maxOffset);
+      if (nextOffset === currentOffset) {
         return current;
       }
-
-      return { ...current, [linkId]: true };
+      return { ...current, [linkId]: nextOffset };
     });
   }
 
-  async function addLinkFromClipboardRaw(raw: string) {
+  function onFaviconLoad(linkId: string, resolvedFaviconUrl: string) {
+    const hadFallback = (faviconFallbackOffsetByLink[linkId] ?? 0) > 0;
+    const previousChoice = faviconChoiceByLink[linkId];
+
+    setFaviconFallbackOffsetByLink((current) => {
+      if (!current[linkId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[linkId];
+      return next;
+    });
+
+    if (!hadFallback && !previousChoice) {
+      return;
+    }
+
+    if (previousChoice === resolvedFaviconUrl) {
+      return;
+    }
+
+    const nextChoices = { ...faviconChoiceByLink, [linkId]: resolvedFaviconUrl };
+    void persistFaviconChoices(nextChoices);
+  }
+
+  async function resolveBestFaviconUrl(link: QuickLink, refreshSeed: number) {
+    const candidates = getRenderableFaviconCandidates(link.url, faviconChoiceByLink[link.id]);
+    const targetHostname = getHostname(link.url);
+    let bestUrl: string | null = null;
+    let bestScore = -Infinity;
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      const source = withCacheBuster(candidates[index], refreshSeed, index);
+      const result = await loadImageDimensions(source, 2200);
+      if (!result.ok) {
+        continue;
+      }
+
+      const score = scoreFaviconCandidate(candidates[index], result.width, result.height, targetHostname);
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = candidates[index];
+      }
+    }
+
+    return bestUrl;
+  }
+
+  async function refreshFavicons() {
+    if (faviconRefreshState === 'loading') {
+      return;
+    }
+
+    if (faviconFeedbackTimerRef.current !== null) {
+      window.clearTimeout(faviconFeedbackTimerRef.current);
+    }
+
+    const refreshableLinks = links.filter((link) => link.useSiteFavicon !== false);
+    setFaviconRefreshState('loading');
+    setFaviconRefreshProgress({ done: 0, total: refreshableLinks.length });
+    setFaviconFallbackOffsetByLink({});
+    const refreshSeed = Date.now();
+    setFaviconRefreshKey(refreshSeed);
+
+    const nextChoices = { ...faviconChoiceByLink };
+    for (let index = 0; index < refreshableLinks.length; index += 1) {
+      const link = refreshableLinks[index];
+      const bestUrl = await resolveBestFaviconUrl(link, refreshSeed);
+      if (bestUrl !== null) {
+        nextChoices[link.id] = bestUrl;
+      }
+
+      setFaviconRefreshProgress({ done: index + 1, total: refreshableLinks.length });
+      await new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+      });
+    }
+
+    await persistFaviconChoices(nextChoices);
+    setFaviconRefreshState('done');
+    setFaviconRefreshProgress({
+      done: refreshableLinks.length,
+      total: refreshableLinks.length,
+    });
+
+    faviconFeedbackTimerRef.current = window.setTimeout(() => {
+      setFaviconRefreshState('idle');
+      setFaviconRefreshProgress(null);
+      faviconFeedbackTimerRef.current = null;
+    }, 900);
+  }
+
+  useEffect(() => {
+    if (faviconRefreshState === 'loading') {
+      return;
+    }
+
+    const pendingLinks = links.filter(
+      (link) => link.useSiteFavicon !== false && !faviconChoiceByLink[link.id],
+    );
+    if (pendingLinks.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      const nextChoices = { ...faviconChoiceByLink };
+      let changed = false;
+
+      for (const link of pendingLinks) {
+        if (cancelled) {
+          return;
+        }
+
+        const bestUrl = await resolveBestFaviconUrl(link, 0);
+        if (bestUrl && nextChoices[link.id] !== bestUrl) {
+          nextChoices[link.id] = bestUrl;
+          changed = true;
+        }
+      }
+
+      if (!cancelled && changed) {
+        await persistFaviconChoices(nextChoices);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [links, faviconChoiceByLink, faviconRefreshState]);
+
+  function resetLinkDraft() {
+    setLinkDraft({ name: '', url: '', icon: 'globe', useSiteFavicon: true });
+  }
+
+  function openAddLinkFlow(params: {
+    initialUrl?: string;
+    initialName?: string;
+    skipUrlStep: boolean;
+  }) {
+    const sanitizedUrl = params.initialUrl ? sanitizeUrl(params.initialUrl) : null;
+    const fallbackName = sanitizedUrl ? getHostname(sanitizedUrl) : '';
+    const initialName = params.initialName?.trim() ?? '';
+
+    setSettingsOpen(true);
+    setSettingsView('links');
+    setLinksPanelMode('add');
+    setEditingLinkId(null);
+    setOpenLinkMenuId(null);
+    setPendingDeleteLinkId(null);
+    setLinkFormError('');
+    setLinkDraft({
+      name: initialName || fallbackName,
+      url: sanitizedUrl ?? '',
+      icon: 'globe',
+      useSiteFavicon: true,
+    });
+    setAddFlowStep(params.skipUrlStep && sanitizedUrl ? 'name' : 'url');
+  }
+
+  function startAddFlowFromRaw(raw: string, skipUrlStep: boolean) {
     const parsed = parseClipboardLink(raw);
     if (!parsed) {
       return;
     }
 
-    const alreadyExists = links.some((link) => link.url === parsed.url);
-    if (alreadyExists) {
-      return;
-    }
-
-    const hostname = getHostname(parsed.url);
-    const nextLink: QuickLink = {
-      id: createLinkId(),
-      name: parsed.name || hostname,
-      url: parsed.url,
-      icon: 'globe',
-      tags: [hostname],
-      order: links.length,
-      createdAt: Date.now(),
-    };
-
-    await persistLinks([...links, nextLink]);
+    openAddLinkFlow({
+      initialUrl: parsed.url,
+      initialName: parsed.name ?? '',
+      skipUrlStep,
+    });
   }
 
-  async function onCreateLink(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function goToAddStep(step: AddFlowStep) {
+    setLinkFormError('');
+    setAddFlowStep(step);
+  }
 
+  function onAddFlowUrlNext() {
     const sanitizedUrl = sanitizeUrl(linkDraft.url);
     if (!sanitizedUrl) {
       setLinkFormError('URL invalida');
@@ -734,36 +1285,252 @@ export default function App() {
     }
 
     const fallbackName = getHostname(sanitizedUrl);
-    const finalName = linkDraft.name.trim() || fallbackName;
-
-    const nextLink: QuickLink = {
-      id: createLinkId(),
-      name: finalName,
+    setLinkDraft((current) => ({
+      ...current,
       url: sanitizedUrl,
-      icon: linkDraft.icon,
-      tags: [fallbackName],
-      order: links.length,
-      createdAt: Date.now(),
-    };
+      name: current.name.trim() || fallbackName,
+    }));
+    goToAddStep('name');
+  }
 
-    await persistLinks([...links, nextLink]);
+  function onAddFlowNameNext() {
+    const sanitizedUrl = sanitizeUrl(linkDraft.url);
+    if (!sanitizedUrl) {
+      setLinkFormError('URL invalida');
+      goToAddStep('url');
+      return;
+    }
+
+    const finalName = linkDraft.name.trim() || getHostname(sanitizedUrl);
+    setLinkDraft((current) => ({ ...current, url: sanitizedUrl, name: finalName }));
+    goToAddStep('favicon');
+  }
+
+  async function saveDraftLink() {
+    const sanitizedUrl = sanitizeUrl(linkDraft.url);
+    if (!sanitizedUrl) {
+      setLinkFormError('URL invalida');
+      return false;
+    }
+
+    const fallbackName = getHostname(sanitizedUrl);
+    const finalName = linkDraft.name.trim() || fallbackName;
+    const duplicate = links.some(
+      (link) => link.id !== editingLinkId && link.url === sanitizedUrl,
+    );
+    if (duplicate) {
+      setLinkFormError('Link ja existe');
+      return false;
+    }
+
+    if (editingLinkId) {
+      const updated = links.map((link) =>
+        link.id === editingLinkId
+          ? {
+              ...link,
+              name: finalName,
+              url: sanitizedUrl,
+              icon: linkDraft.icon,
+              useSiteFavicon: linkDraft.useSiteFavicon,
+              tags: [fallbackName],
+            }
+          : link,
+      );
+
+      await persistLinks(updated);
+      setEditingLinkId(null);
+      setLinksPanelMode('manage');
+    } else {
+      const nextLink: QuickLink = {
+        id: createLinkId(),
+        name: finalName,
+        url: sanitizedUrl,
+        icon: linkDraft.icon,
+        useSiteFavicon: linkDraft.useSiteFavicon,
+        tags: [fallbackName],
+        order: links.length,
+        createdAt: Date.now(),
+        accessLog: [],
+      };
+
+      await persistLinks([...links, nextLink]);
+      setLinksPanelMode('manage');
+    }
+
     setLinkFormError('');
-    setLinkDraft({ name: '', url: '', icon: 'globe' });
+    resetLinkDraft();
+    setAddFlowStep('url');
+    return true;
+  }
+
+  async function onCreateLink(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await saveDraftLink();
+  }
+
+  async function onAddFlowFaviconNext() {
+    if (linkDraft.useSiteFavicon) {
+      await saveDraftLink();
+      return;
+    }
+
+    goToAddStep('icon');
+  }
+
+  async function onAddFlowIconSave() {
+    await saveDraftLink();
   }
 
   async function onDeleteLink(linkId: string) {
     await persistLinks(links.filter((link) => link.id !== linkId));
+    if (editingLinkId === linkId) {
+      setEditingLinkId(null);
+      resetLinkDraft();
+      setLinkFormError('');
+      setAddFlowStep('url');
+    }
+  }
+
+  async function onOpenLink(link: QuickLink) {
+    const nowTs = Date.now();
+    try {
+      const nextLinks = links.map((item) => {
+        const prunedLog = pruneRecentAccessLog(item.accessLog, nowTs);
+        if (item.id === link.id) {
+          return { ...item, accessLog: [...prunedLog, nowTs] };
+        }
+
+        if (prunedLog.length !== item.accessLog.length) {
+          return { ...item, accessLog: prunedLog };
+        }
+
+        return item;
+      });
+      await persistLinks(nextLinks);
+    } finally {
+      window.location.assign(link.url);
+    }
+  }
+
+  async function onDropLink(targetId: string) {
+    if (!draggedLinkId || draggedLinkId === targetId) {
+      setDraggedLinkId(null);
+      return;
+    }
+
+    const reordered = reorderById(links, draggedLinkId, targetId);
+    setDraggedLinkId(null);
+    await persistLinks(reordered);
+  }
+
+  function onOpenGridContextMenu(event: ReactMouseEvent, linkId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    setGridContextMenu({ linkId, x: event.clientX, y: event.clientY });
   }
 
   function closeSettings() {
     setSettingsOpen(false);
     setSettingsView('menu');
+    setOpenLinkMenuId(null);
+    setPendingDeleteLinkId(null);
+    setGridContextMenu(null);
+    if (!editingLinkId) {
+      setAddFlowStep('url');
+      setLinkFormError('');
+    }
   }
+
+  function onToggleLinkMenu(linkId: string) {
+    setOpenLinkMenuId((current) => (current === linkId ? null : linkId));
+    setPendingDeleteLinkId(null);
+  }
+
+  function onStartEditLink(link: QuickLink) {
+    setEditingLinkId(link.id);
+    setLinkDraft({
+      name: link.name,
+      url: link.url,
+      icon: link.icon,
+      useSiteFavicon: link.useSiteFavicon,
+    });
+    setAddFlowStep('name');
+    setLinkFormError('');
+    setLinksPanelMode('add');
+    setOpenLinkMenuId(null);
+    setPendingDeleteLinkId(null);
+  }
+
+  function onCancelEditLink() {
+    setEditingLinkId(null);
+    resetLinkDraft();
+    setAddFlowStep('url');
+    setLinkFormError('');
+  }
+
+  function onRequestDeleteLink(linkId: string) {
+    if (pendingDeleteLinkId === linkId) {
+      setPendingDeleteLinkId(null);
+      setOpenLinkMenuId(null);
+      void onDeleteLink(linkId);
+      return;
+    }
+
+    setPendingDeleteLinkId(linkId);
+  }
+
+  function onGridContextEdit(linkId: string) {
+    const link = links.find((item) => item.id === linkId);
+    if (!link) {
+      setGridContextMenu(null);
+      return;
+    }
+
+    setGridContextMenu(null);
+    onStartEditLink(link);
+    setSettingsOpen(true);
+    setSettingsView('links');
+  }
+
+  function onGridContextDelete(linkId: string) {
+    setGridContextMenu(null);
+    void onDeleteLink(linkId);
+  }
+
+  const clockStyle = {
+    '--clock-scale': `${safeClockScale / 100}`,
+  } as CSSProperties;
+  const faviconRefreshPercent =
+    faviconRefreshProgress && faviconRefreshProgress.total > 0
+      ? Math.round((faviconRefreshProgress.done / faviconRefreshProgress.total) * 100)
+      : 0;
+  const gridContextLink = gridContextMenu
+    ? links.find((item) => item.id === gridContextMenu.linkId) ?? null
+    : null;
+  const gridContextStyle = useMemo(() => {
+    if (!gridContextMenu) {
+      return null;
+    }
+
+    const menuWidth = 168;
+    const menuHeight = 96;
+    const pad = 8;
+    const left = Math.max(
+      pad,
+      Math.min(gridContextMenu.x, window.innerWidth - menuWidth - pad),
+    );
+    const top = Math.max(
+      pad,
+      Math.min(gridContextMenu.y, window.innerHeight - menuHeight - pad),
+    );
+
+    return { left, top } as CSSProperties;
+  }, [gridContextMenu]);
 
   return (
     <main className="screen">
       <header className="top-area">
-        <div className="clock-center" aria-live="polite">
+        <div className="clock-center" aria-live="polite" style={clockStyle}>
           {clockText}
         </div>
         <div className={query ? 'query-chip is-active' : 'query-chip'}>
@@ -796,27 +1563,55 @@ export default function App() {
                   >
                     {column.map((link) => {
                       const Icon = ICON_BY_KEY[link.icon] ?? Globe;
+                      const useSiteFavicon = link.useSiteFavicon !== false;
+                      const faviconCandidates = getRenderableFaviconCandidates(
+                        link.url,
+                        faviconChoiceByLink[link.id],
+                      );
+                      const fallbackOffset = faviconFallbackOffsetByLink[link.id] ?? 0;
+                      const resolvedIndex = Math.min(
+                        fallbackOffset,
+                        Math.max(0, faviconCandidates.length - 1),
+                      );
+                      const useFallbackIcon =
+                        !useSiteFavicon || faviconCandidates.length === 0;
+                      const faviconSrc = useFallbackIcon
+                        ? ''
+                        : withCacheBuster(
+                            faviconCandidates[resolvedIndex],
+                            faviconRefreshKey,
+                            resolvedIndex,
+                          );
                       return (
                         <a
                           key={link.id}
                           className="link-tile"
                           href={link.url}
-                          title={link.name}
+                          aria-label={link.name}
+                          onContextMenu={(event) => onOpenGridContextMenu(event, link.id)}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            void onOpenLink(link);
+                          }}
                         >
                           <span
                             className="link-icon"
                             style={{ width: safeIconSize, height: safeIconSize }}
                           >
-                            {failedFavicons[link.id] ? (
+                            {useFallbackIcon ? (
                               <Icon size={Math.round(safeIconSize * 0.46)} strokeWidth={1.85} />
                             ) : (
-                              <img
-                                src={getFaviconUrl(link.url)}
-                                alt=""
-                                loading="lazy"
-                                onError={() => markFaviconFailure(link.id)}
+                                <img
+                                  src={faviconSrc}
+                                  alt=""
+                                  loading="lazy"
+                                  onLoad={() => onFaviconLoad(link.id, faviconCandidates[resolvedIndex])}
+                                  onError={() => onFaviconError(link.id, faviconCandidates.length)}
                               />
                             )}
+                          </span>
+                          <span className="link-tooltip" aria-hidden="true">
+                            {link.name}
                           </span>
                         </a>
                       );
@@ -843,6 +1638,30 @@ export default function App() {
           </div>
         </footer>
       </section>
+
+      {gridContextMenu && gridContextLink && gridContextStyle ? (
+        <div
+          className="grid-context-menu"
+          ref={gridContextMenuRef}
+          style={gridContextStyle}
+          role="menu"
+          aria-label={`Acoes de ${gridContextLink.name}`}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button type="button" className="grid-context-item" onClick={() => onGridContextEdit(gridContextLink.id)}>
+            <Pencil size={13} strokeWidth={2} />
+            Editar
+          </button>
+          <button
+            type="button"
+            className="grid-context-item is-danger"
+            onClick={() => onGridContextDelete(gridContextLink.id)}
+          >
+            <Trash2 size={13} strokeWidth={2} />
+            Excluir
+          </button>
+        </div>
+      ) : null}
 
       <button
         type="button"
@@ -976,6 +1795,22 @@ export default function App() {
                       }
                     />
                   </label>
+
+                  <label className="control-row clock-size-row">
+                    <span>Tamanho ({safeClockScale}%)</span>
+                    <input
+                      type="range"
+                      min={60}
+                      max={150}
+                      step={2}
+                      value={safeClockScale}
+                      onChange={(event) =>
+                        void persistSettings({
+                          clockScale: toSafeInt(event.target.value, 60, 150, safeClockScale),
+                        })
+                      }
+                    />
+                  </label>
                 </section>
               ) : null}
 
@@ -1044,95 +1879,443 @@ export default function App() {
 
               {settingsView === 'links' ? (
                 <section className="settings-section">
-                  <h3 className="section-heading">
-                    <Link2 size={16} strokeWidth={2} />
-                    Links
-                  </h3>
-
-                  <form className="link-create-form" onSubmit={onCreateLink}>
-                    <input
-                      value={linkDraft.name}
-                      onChange={(event) =>
-                        setLinkDraft((current) => ({ ...current, name: event.target.value }))
-                      }
-                      placeholder="Nome"
-                    />
-                    <input
-                      value={linkDraft.url}
-                      onChange={(event) =>
-                        setLinkDraft((current) => ({ ...current, url: event.target.value }))
-                      }
-                      placeholder="URL"
-                    />
-
-                    <div className="icon-picker" role="group" aria-label="Icone do link">
-                      {ICON_OPTIONS.map((option) => {
-                        const Icon = option.icon;
-                        return (
-                          <button
-                            key={option.key}
-                            type="button"
-                            className={
-                              linkDraft.icon === option.key
-                                ? 'icon-choice is-active'
-                                : 'icon-choice'
-                            }
-                            onClick={() =>
-                              setLinkDraft((current) => ({ ...current, icon: option.key }))
-                            }
-                            aria-label={option.label}
-                            title={option.label}
-                          >
-                            <Icon size={15} strokeWidth={2} />
-                          </button>
-                        );
-                      })}
+                  <div className="section-heading-row">
+                    <h3 className="section-heading">
+                      <Link2 size={16} strokeWidth={2} />
+                      Links
+                    </h3>
+                    <div className="links-toolbar">
+                      <button
+                        type="button"
+                        className={linksPanelMode === 'add' ? 'icon-button is-active' : 'icon-button'}
+                        onClick={() => {
+                          setLinksPanelMode('add');
+                          setOpenLinkMenuId(null);
+                          setPendingDeleteLinkId(null);
+                          if (!editingLinkId) {
+                            goToAddStep('url');
+                            resetLinkDraft();
+                          }
+                        }}
+                        aria-label="Adicionar link"
+                        title="Adicionar link"
+                      >
+                        <Plus size={15} strokeWidth={2.2} />
+                      </button>
+                      <button
+                        type="button"
+                        className={linksPanelMode === 'manage' ? 'icon-button is-active' : 'icon-button'}
+                        onClick={() => {
+                          setLinksPanelMode('manage');
+                          setOpenLinkMenuId(null);
+                          setPendingDeleteLinkId(null);
+                        }}
+                        aria-label="Lista de links"
+                        title="Lista de links"
+                      >
+                        <GripVertical size={15} strokeWidth={2} />
+                      </button>
+                      <button
+                        type="button"
+                        className={linksPanelMode === 'overview' ? 'icon-button is-active' : 'icon-button'}
+                        onClick={() => {
+                          setLinksPanelMode('overview');
+                          setOpenLinkMenuId(null);
+                          setPendingDeleteLinkId(null);
+                        }}
+                        aria-label="Ordenacao"
+                        title="Ordenacao"
+                      >
+                        <ArrowUpDown size={15} strokeWidth={2} />
+                      </button>
+                      <button
+                        type="button"
+                        className={
+                          faviconRefreshState === 'loading'
+                            ? 'icon-button feedback-loading'
+                            : faviconRefreshState === 'done'
+                              ? 'icon-button feedback-done'
+                              : 'icon-button'
+                        }
+                        onClick={refreshFavicons}
+                        disabled={faviconRefreshState === 'loading'}
+                        aria-label="Atualizar favicons"
+                        title="Atualizar favicons"
+                      >
+                        <RefreshCw size={15} strokeWidth={2} />
+                      </button>
                     </div>
+                  </div>
+                  {faviconRefreshState === 'loading' ? (
+                    <div className="refresh-progress">
+                      <p className="refresh-feedback">
+                        Atualizando favicons... {faviconRefreshPercent}% (
+                        {faviconRefreshProgress?.done ?? 0}/{faviconRefreshProgress?.total ?? 0})
+                      </p>
+                      <div className="refresh-progress-track" aria-hidden="true">
+                        <span
+                          className="refresh-progress-fill"
+                          style={{ width: `${Math.max(0, Math.min(100, faviconRefreshPercent))}%` }}
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+                  {faviconRefreshState === 'done' ? (
+                    <p className="refresh-feedback is-success">Favicons atualizados</p>
+                  ) : null}
+                  {linksPanelMode === 'overview' ? (
+                    <div className="control-row">
+                      <span>Ordenacao</span>
+                      <div className="segmented">
+                        <button
+                          type="button"
+                          className={
+                            (settings.linksSortMode ?? DEFAULT_SETTINGS.linksSortMode) === 'manual'
+                              ? 'seg-option is-active'
+                              : 'seg-option'
+                          }
+                          onClick={() => void persistSettings({ linksSortMode: 'manual' })}
+                        >
+                          Manual
+                        </button>
+                        <button
+                          type="button"
+                          className={
+                            (settings.linksSortMode ?? DEFAULT_SETTINGS.linksSortMode) ===
+                            'most_accessed'
+                              ? 'seg-option is-active'
+                              : 'seg-option'
+                          }
+                          onClick={() => void persistSettings({ linksSortMode: 'most_accessed' })}
+                        >
+                          Mais acessados
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
 
-                    <button type="submit" className="add-link-button" aria-label="Adicionar link">
-                      <Plus size={16} strokeWidth={2.2} />
-                    </button>
-                  </form>
-
-                  {linkFormError ? <p className="form-error">{linkFormError}</p> : null}
-
-                  <ul className="links-list">
-                    {links.map((link) => {
-                      const Icon = ICON_BY_KEY[link.icon] ?? Globe;
-                      return (
-                        <li key={link.id}>
-                          <div className="links-list-item">
-                            <div className="links-list-main">
-                              <span className="list-icon-wrap">
-                                {failedFavicons[link.id] ? (
-                                  <Icon size={14} strokeWidth={2} />
-                                ) : (
-                                  <img
-                                    src={getFaviconUrl(link.url)}
-                                    alt=""
-                                    loading="lazy"
-                                    onError={() => markFaviconFailure(link.id)}
-                                  />
-                                )}
-                              </span>
-                              <div>
-                                <strong>{link.name}</strong>
-                                <small>{getHostname(link.url)}</small>
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              className="icon-button danger"
-                              onClick={() => void onDeleteLink(link.id)}
-                              aria-label={`Remover ${link.name}`}
-                            >
-                              <Trash2 size={14} strokeWidth={2} />
+                  {linksPanelMode === 'add' ? (
+                    <>
+                      {editingLinkId ? (
+                        <>
+                          <div className="edit-mode-banner">
+                            <span>Editando link</span>
+                            <button type="button" className="icon-button" onClick={onCancelEditLink}>
+                              <X size={14} strokeWidth={2.2} />
                             </button>
                           </div>
-                        </li>
-                      );
-                    })}
-                  </ul>
+                          <form className="link-create-form" onSubmit={onCreateLink}>
+                            <input
+                              value={linkDraft.name}
+                              onChange={(event) =>
+                                setLinkDraft((current) => ({ ...current, name: event.target.value }))
+                              }
+                              placeholder="Nome"
+                            />
+                            <input
+                              value={linkDraft.url}
+                              onChange={(event) =>
+                                setLinkDraft((current) => ({ ...current, url: event.target.value }))
+                              }
+                              placeholder="URL"
+                            />
+
+                            <div className="icon-picker" role="group" aria-label="Icone do link">
+                              {ICON_OPTIONS.map((option) => {
+                                const Icon = option.icon;
+                                return (
+                                  <button
+                                    key={option.key}
+                                    type="button"
+                                    className={
+                                      linkDraft.icon === option.key
+                                        ? 'icon-choice is-active'
+                                        : 'icon-choice'
+                                    }
+                                    onClick={() =>
+                                      setLinkDraft((current) => ({ ...current, icon: option.key }))
+                                    }
+                                    aria-label={option.label}
+                                    title={option.label}
+                                  >
+                                    <Icon size={15} strokeWidth={2} />
+                                  </button>
+                                );
+                              })}
+                            </div>
+
+                            <div className="segmented" role="group" aria-label="Fonte do icone">
+                              <button
+                                type="button"
+                                className={linkDraft.useSiteFavicon ? 'seg-option is-active' : 'seg-option'}
+                                onClick={() =>
+                                  setLinkDraft((current) => ({ ...current, useSiteFavicon: true }))
+                                }
+                              >
+                                Favicon
+                              </button>
+                              <button
+                                type="button"
+                                className={!linkDraft.useSiteFavicon ? 'seg-option is-active' : 'seg-option'}
+                                onClick={() =>
+                                  setLinkDraft((current) => ({ ...current, useSiteFavicon: false }))
+                                }
+                              >
+                                Personalizado
+                              </button>
+                            </div>
+
+                            <button type="submit" className="add-link-button" aria-label="Salvar link">
+                              <Pencil size={15} strokeWidth={2.2} />
+                            </button>
+                          </form>
+                        </>
+                      ) : (
+                        <div className="add-flow">
+                          {addFlowStep === 'url' ? (
+                            <>
+                              <label className="flow-label">URL do link</label>
+                              <input
+                                className="flow-input"
+                                value={linkDraft.url}
+                                onChange={(event) =>
+                                  setLinkDraft((current) => ({ ...current, url: event.target.value }))
+                                }
+                                placeholder="https://exemplo.com"
+                              />
+                              <div className="flow-actions">
+                                <button type="button" className="seg-option is-active" onClick={onAddFlowUrlNext}>
+                                  Continuar
+                                </button>
+                              </div>
+                            </>
+                          ) : null}
+
+                          {addFlowStep === 'name' ? (
+                            <>
+                              <label className="flow-label">Nome do link</label>
+                              <input
+                                className="flow-input"
+                                value={linkDraft.name}
+                                onChange={(event) =>
+                                  setLinkDraft((current) => ({ ...current, name: event.target.value }))
+                                }
+                                placeholder={getHostname(linkDraft.url || 'link')}
+                              />
+                              <div className="flow-actions">
+                                <button type="button" className="seg-option" onClick={() => goToAddStep('url')}>
+                                  Voltar
+                                </button>
+                                <button type="button" className="seg-option is-active" onClick={onAddFlowNameNext}>
+                                  Continuar
+                                </button>
+                              </div>
+                            </>
+                          ) : null}
+
+                          {addFlowStep === 'favicon' ? (
+                            <>
+                              <label className="flow-label">Fonte do icone</label>
+                              <div className="favicon-choice">
+                                <span className="favicon-preview">
+                                  {getFaviconCandidates(linkDraft.url)[0] ? (
+                                    <img
+                                      src={withCacheBuster(getFaviconCandidates(linkDraft.url)[0], faviconRefreshKey, 0)}
+                                      alt=""
+                                    />
+                                  ) : (
+                                    <Globe size={16} strokeWidth={2} />
+                                  )}
+                                </span>
+                                <div className="segmented">
+                                  <button
+                                    type="button"
+                                    className={linkDraft.useSiteFavicon ? 'seg-option is-active' : 'seg-option'}
+                                    onClick={() =>
+                                      setLinkDraft((current) => ({ ...current, useSiteFavicon: true }))
+                                    }
+                                  >
+                                    Usar favicon
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={!linkDraft.useSiteFavicon ? 'seg-option is-active' : 'seg-option'}
+                                    onClick={() =>
+                                      setLinkDraft((current) => ({ ...current, useSiteFavicon: false }))
+                                    }
+                                  >
+                                    Personalizar
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="flow-actions">
+                                <button type="button" className="seg-option" onClick={() => goToAddStep('name')}>
+                                  Voltar
+                                </button>
+                                <button type="button" className="seg-option is-active" onClick={() => void onAddFlowFaviconNext()}>
+                                  {linkDraft.useSiteFavicon ? 'Salvar' : 'Continuar'}
+                                </button>
+                              </div>
+                            </>
+                          ) : null}
+
+                          {addFlowStep === 'icon' ? (
+                            <>
+                              <label className="flow-label">Escolha um icone</label>
+                              <div className="icon-picker" role="group" aria-label="Icone do link">
+                                {ICON_OPTIONS.map((option) => {
+                                  const Icon = option.icon;
+                                  return (
+                                    <button
+                                      key={option.key}
+                                      type="button"
+                                      className={
+                                        linkDraft.icon === option.key ? 'icon-choice is-active' : 'icon-choice'
+                                      }
+                                      onClick={() =>
+                                        setLinkDraft((current) => ({ ...current, icon: option.key }))
+                                      }
+                                      aria-label={option.label}
+                                      title={option.label}
+                                    >
+                                      <Icon size={15} strokeWidth={2} />
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <div className="flow-actions">
+                                <button type="button" className="seg-option" onClick={() => goToAddStep('favicon')}>
+                                  Voltar
+                                </button>
+                                <button type="button" className="seg-option is-active" onClick={() => void onAddFlowIconSave()}>
+                                  Salvar
+                                </button>
+                              </div>
+                            </>
+                          ) : null}
+                        </div>
+                      )}
+
+                      {linkFormError ? <p className="form-error">{linkFormError}</p> : null}
+                    </>
+                  ) : null}
+
+                  {linksPanelMode === 'manage' ? (
+                    <ul className="links-list">
+                      {displayLinks.map((link) => {
+                        const Icon = ICON_BY_KEY[link.icon] ?? Globe;
+                        const useSiteFavicon = link.useSiteFavicon !== false;
+                        const faviconCandidates = getRenderableFaviconCandidates(
+                          link.url,
+                          faviconChoiceByLink[link.id],
+                        );
+                        const fallbackOffset = faviconFallbackOffsetByLink[link.id] ?? 0;
+                        const resolvedIndex = Math.min(
+                          fallbackOffset,
+                          Math.max(0, faviconCandidates.length - 1),
+                        );
+                        const useFallbackIcon =
+                          !useSiteFavicon || faviconCandidates.length === 0;
+                        const faviconSrc = useFallbackIcon
+                          ? ''
+                          : withCacheBuster(
+                              faviconCandidates[resolvedIndex],
+                              faviconRefreshKey,
+                              resolvedIndex,
+                            );
+                        const manualSort =
+                          (settings.linksSortMode ?? DEFAULT_SETTINGS.linksSortMode) === 'manual';
+                        return (
+                          <li
+                            key={link.id}
+                            draggable={manualSort}
+                            onDragStart={() => setDraggedLinkId(link.id)}
+                            onDragOver={(event) => {
+                              if (manualSort) {
+                                event.preventDefault();
+                              }
+                            }}
+                            onDrop={(event) => {
+                              event.preventDefault();
+                              if (manualSort) {
+                                void onDropLink(link.id);
+                              }
+                            }}
+                            onDragEnd={() => setDraggedLinkId(null)}
+                          >
+                            <div className="links-list-item">
+                              <div className="links-list-main">
+                                {manualSort ? (
+                                  <span className="drag-handle" aria-hidden="true">
+                                    <GripVertical size={14} strokeWidth={2} />
+                                  </span>
+                                ) : null}
+                                <span className="list-icon-wrap">
+                                  {useFallbackIcon ? (
+                                    <Icon size={14} strokeWidth={2} />
+                                  ) : (
+                                    <img
+                                      src={faviconSrc}
+                                      alt=""
+                                      loading="lazy"
+                                      onLoad={() => onFaviconLoad(link.id, faviconCandidates[resolvedIndex])}
+                                      onError={() => onFaviconError(link.id, faviconCandidates.length)}
+                                    />
+                                  )}
+                                </span>
+                                <div className="list-text">
+                                  <strong>{link.name}</strong>
+                                </div>
+                              </div>
+                              <div
+                                className="link-actions"
+                                ref={openLinkMenuId === link.id ? linkMenuRootRef : null}
+                              >
+                                <button
+                                  type="button"
+                                  className={openLinkMenuId === link.id ? 'icon-button is-active' : 'icon-button'}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    onToggleLinkMenu(link.id);
+                                  }}
+                                  aria-label={`Mais opcoes para ${link.name}`}
+                                  aria-expanded={openLinkMenuId === link.id}
+                                >
+                                  <MoreVertical size={14} strokeWidth={2} />
+                                </button>
+
+                                {openLinkMenuId === link.id ? (
+                                  <div className="link-more-menu" role="menu" aria-label={`Acoes de ${link.name}`}>
+                                    <button
+                                      type="button"
+                                      className="link-more-item"
+                                      onClick={() => onStartEditLink(link)}
+                                    >
+                                      <Pencil size={13} strokeWidth={2} />
+                                      Editar
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className={
+                                        pendingDeleteLinkId === link.id
+                                          ? 'link-more-item is-danger is-confirm'
+                                          : 'link-more-item is-danger'
+                                      }
+                                      onClick={() => onRequestDeleteLink(link.id)}
+                                    >
+                                      <Trash2 size={13} strokeWidth={2} />
+                                      {pendingDeleteLinkId === link.id ? 'Confirmar' : 'Deletar'}
+                                    </button>
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  ) : null}
                 </section>
               ) : null}
 

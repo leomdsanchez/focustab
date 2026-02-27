@@ -18,14 +18,18 @@ export interface QuickLink {
   name: string;
   url: string;
   icon: LinkIconKey;
+  useSiteFavicon: boolean;
   tags: string[];
   order: number;
   createdAt: number;
+  accessLog: number[];
 }
 
 export interface AppSettings {
   clockMode: ClockMode;
   showSeconds: boolean;
+  clockScale: number;
+  linksSortMode: 'manual' | 'most_accessed';
   gridCols: number;
   gridRows: number;
   iconSize: number;
@@ -37,15 +41,19 @@ interface AppMeta {
 
 const EXTENSION_SETTINGS_KEY = 'settings';
 const EXTENSION_LINKS_KEY = 'links';
+const EXTENSION_FAVICON_PREFS_KEY = 'faviconPrefs';
 const EXTENSION_META_KEY = 'meta';
 
 const LOCAL_SETTINGS_KEY = 'focustab.settings';
 const LOCAL_LINKS_KEY = 'focustab.links';
+const LOCAL_FAVICON_PREFS_KEY = 'focustab.faviconPrefs';
 const LOCAL_META_KEY = 'focustab.meta';
 
 export const DEFAULT_SETTINGS: AppSettings = {
   clockMode: '24h',
   showSeconds: false,
+  clockScale: 100,
+  linksSortMode: 'manual',
   gridCols: 5,
   gridRows: 2,
   iconSize: 68,
@@ -54,6 +62,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
 const DEFAULT_META: AppMeta = {
   linksSeeded: false,
 };
+
+const RECENT_ACCESS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 const SEEDED_LINKS: Array<Pick<QuickLink, 'name' | 'url' | 'icon' | 'tags'>> = [
   {
@@ -176,10 +186,34 @@ function createSeedLinks() {
     name: link.name,
     url: link.url,
     icon: link.icon,
+    useSiteFavicon: true,
     tags: link.tags,
     order: index,
     createdAt: now + index,
+    accessLog: [],
   }));
+}
+
+function normalizeAccessLog(rawLog: unknown, legacyCount: unknown, now = Date.now()) {
+  const minTs = now - RECENT_ACCESS_WINDOW_MS;
+  const normalized =
+    Array.isArray(rawLog)
+      ? rawLog
+          .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+          .map((value) => Math.round(value))
+          .filter((value) => value >= minTs && value <= now + 60_000)
+      : [];
+
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  // Migration for old schema (accessedCount only): keep one recent event if count was positive.
+  if (typeof legacyCount === 'number' && legacyCount > 0 && Number.isFinite(legacyCount)) {
+    return [now];
+  }
+
+  return [];
 }
 
 function normalizeLinks(rawLinks: unknown): QuickLink[] {
@@ -187,10 +221,12 @@ function normalizeLinks(rawLinks: unknown): QuickLink[] {
     return [];
   }
 
+  const now = Date.now();
+
   return rawLinks
-    .filter((value): value is Partial<QuickLink> => typeof value === 'object' && value !== null)
+    .filter((value): value is Record<string, unknown> => typeof value === 'object' && value !== null)
     .filter(
-      (value): value is QuickLink =>
+      (value) =>
         typeof value.id === 'string' &&
         typeof value.name === 'string' &&
         typeof value.url === 'string' &&
@@ -200,8 +236,20 @@ function normalizeLinks(rawLinks: unknown): QuickLink[] {
         typeof value.createdAt === 'number',
     )
     .map((link) => ({
-      ...link,
-      tags: link.tags.filter((tag): tag is string => typeof tag === 'string'),
+      id: link.id as string,
+      name: link.name as string,
+      url: link.url as string,
+      icon: link.icon as LinkIconKey,
+      useSiteFavicon:
+        typeof link.useSiteFavicon === 'boolean' ? link.useSiteFavicon : true,
+      tags: (link.tags as unknown[]).filter((tag): tag is string => typeof tag === 'string'),
+      order: Math.round(link.order as number),
+      createdAt: Math.round(link.createdAt as number),
+      accessLog: normalizeAccessLog(
+        link.accessLog,
+        link.accessedCount,
+        now,
+      ),
     }));
 }
 
@@ -313,4 +361,51 @@ export async function saveLinks(nextLinks: QuickLink[]): Promise<QuickLink[]> {
 
   await browser.storage.local.set({ [EXTENSION_LINKS_KEY]: sorted });
   return sorted;
+}
+
+function normalizeFaviconPrefs(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const entries = Object.entries(raw as Record<string, unknown>);
+  const normalized: Record<string, string> = {};
+  for (const [linkId, value] of entries) {
+    if (typeof linkId !== 'string' || !linkId) {
+      continue;
+    }
+    if (typeof value !== 'string') {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    normalized[linkId] = trimmed;
+  }
+
+  return normalized;
+}
+
+export async function getFaviconPrefs(): Promise<Record<string, string>> {
+  if (!hasExtensionStorage()) {
+    return normalizeFaviconPrefs(localRead<unknown>(LOCAL_FAVICON_PREFS_KEY, {}));
+  }
+
+  const data = await browser.storage.local.get(EXTENSION_FAVICON_PREFS_KEY);
+  return normalizeFaviconPrefs(data?.[EXTENSION_FAVICON_PREFS_KEY]);
+}
+
+export async function saveFaviconPrefs(
+  nextPrefs: Record<string, string>,
+): Promise<Record<string, string>> {
+  const normalized = normalizeFaviconPrefs(nextPrefs);
+
+  if (!hasExtensionStorage()) {
+    localWrite(LOCAL_FAVICON_PREFS_KEY, normalized);
+    return normalized;
+  }
+
+  await browser.storage.local.set({ [EXTENSION_FAVICON_PREFS_KEY]: normalized });
+  return normalized;
 }
