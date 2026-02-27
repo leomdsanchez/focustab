@@ -21,16 +21,20 @@ import {
   Globe,
   GripVertical,
   Grid3x3,
+  Image as ImageIcon,
   Linkedin,
   Link2,
   Mail,
   MessageCircle,
   MoreVertical,
+  Pin,
+  PinOff,
   Palette,
   Pencil,
   Plus,
   RefreshCw,
   Settings,
+  Shuffle,
   Trash2,
   Twitter,
   X,
@@ -51,7 +55,7 @@ import {
   type QuickLink,
 } from '../../src/lib/storage';
 
-type SettingsView = 'menu' | 'clock' | 'grid' | 'links';
+type SettingsView = 'menu' | 'clock' | 'grid' | 'background' | 'links';
 
 interface LinkDraft {
   name: string;
@@ -66,6 +70,12 @@ interface GridContextMenuState {
   linkId: string;
   x: number;
   y: number;
+}
+
+interface BackgroundItem {
+  id: string;
+  full: string;
+  thumb: string;
 }
 
 const ICON_BY_KEY: Record<LinkIconKey, LucideIcon> = {
@@ -94,6 +104,159 @@ const ICON_OPTIONS: Array<{ key: LinkIconKey; icon: LucideIcon; label: string }>
   { key: 'x', icon: Twitter, label: 'X' },
   { key: 'whatsapp', icon: MessageCircle, label: 'Chat' },
 ];
+
+const BACKGROUND_CACHE_KEY = 'focustab.backgroundCache.v1';
+const BACKGROUND_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const BACKGROUND_ROTATE_INTERVAL_MS = 3 * 60 * 1000;
+
+function createGradientBackground(seed: string, from: string, to: string, glow: string): string {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1200' viewBox='0 0 1920 1200'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='${from}'/><stop offset='100%' stop-color='${to}'/></linearGradient><radialGradient id='r' cx='0.75' cy='0.2' r='0.7'><stop offset='0%' stop-color='${glow}' stop-opacity='0.32'/><stop offset='100%' stop-color='${glow}' stop-opacity='0'/></radialGradient></defs><rect width='1920' height='1200' fill='url(#g)'/><rect width='1920' height='1200' fill='url(#r)'/><text x='1880' y='1160' fill='#0d1118' fill-opacity='0.2' font-size='24' text-anchor='end' font-family='Arial, sans-serif'>${seed}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+const FALLBACK_BACKGROUNDS: BackgroundItem[] = [
+  {
+    id: 'fallback-graphite-1',
+    full: createGradientBackground('FocusTab-01', '#0f1117', '#181c24', '#4f86a4'),
+    thumb: createGradientBackground('FocusTab-01', '#0f1117', '#181c24', '#4f86a4'),
+  },
+  {
+    id: 'fallback-graphite-2',
+    full: createGradientBackground('FocusTab-02', '#0b0d12', '#1b2029', '#3e6b57'),
+    thumb: createGradientBackground('FocusTab-02', '#0b0d12', '#1b2029', '#3e6b57'),
+  },
+  {
+    id: 'fallback-graphite-3',
+    full: createGradientBackground('FocusTab-03', '#101216', '#1a1f28', '#7b5b3e'),
+    thumb: createGradientBackground('FocusTab-03', '#101216', '#1a1f28', '#7b5b3e'),
+  },
+  {
+    id: 'fallback-graphite-4',
+    full: createGradientBackground('FocusTab-04', '#0d1015', '#171b22', '#5b5f8f'),
+    thumb: createGradientBackground('FocusTab-04', '#0d1015', '#171b22', '#5b5f8f'),
+  },
+];
+
+function normalizeBackgroundItems(raw: unknown): BackgroundItem[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const items: BackgroundItem[] = [];
+  const seenIds = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const payload = entry as Record<string, unknown>;
+    const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+    const full = typeof payload.full === 'string' ? payload.full.trim() : '';
+    const thumb =
+      typeof payload.thumb === 'string' && payload.thumb.trim()
+        ? payload.thumb.trim()
+        : full;
+
+    if (!id || !full || seenIds.has(id)) {
+      continue;
+    }
+
+    seenIds.add(id);
+    items.push({ id, full, thumb });
+  }
+
+  return items;
+}
+
+function readBackgroundCache(): { updatedAt: number; items: BackgroundItem[] } {
+  try {
+    const raw = window.localStorage.getItem(BACKGROUND_CACHE_KEY);
+    if (!raw) {
+      return { updatedAt: 0, items: [] };
+    }
+
+    const parsed = JSON.parse(raw) as { updatedAt?: unknown; items?: unknown };
+    const updatedAt = typeof parsed.updatedAt === 'number' && Number.isFinite(parsed.updatedAt)
+      ? Math.round(parsed.updatedAt)
+      : 0;
+    const items = normalizeBackgroundItems(parsed.items);
+    return { updatedAt, items };
+  } catch {
+    return { updatedAt: 0, items: [] };
+  }
+}
+
+function saveBackgroundCache(items: BackgroundItem[]) {
+  try {
+    window.localStorage.setItem(
+      BACKGROUND_CACHE_KEY,
+      JSON.stringify({
+        updatedAt: Date.now(),
+        items,
+      }),
+    );
+  } catch {
+    // Ignore storage quota and private mode failures.
+  }
+}
+
+async function fetchPexelsBackgrounds(signal?: AbortSignal): Promise<BackgroundItem[]> {
+  const env = import.meta.env as Record<string, string | undefined>;
+  const apiKey = (env.PEXELS_API_KEY ?? env.VITE_PEXELS_API_KEY ?? '').trim();
+  if (!apiKey) {
+    return [];
+  }
+
+  try {
+    const response = await fetch(
+      'https://api.pexels.com/v1/search?query=dark%20minimal%20wallpaper&orientation=landscape&size=large&per_page=30',
+      {
+        headers: {
+          Authorization: apiKey,
+        },
+        signal,
+      },
+    );
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = (await response.json()) as {
+      photos?: Array<{
+        id?: number;
+        src?: Record<string, string | undefined>;
+      }>;
+    };
+
+    if (!Array.isArray(payload.photos)) {
+      return [];
+    }
+
+    const items: BackgroundItem[] = [];
+    const seen = new Set<string>();
+    for (const photo of payload.photos) {
+      if (!photo || typeof photo !== 'object') {
+        continue;
+      }
+
+      const idNumber = typeof photo.id === 'number' && Number.isFinite(photo.id) ? Math.round(photo.id) : null;
+      const id = idNumber !== null ? `pexels-${idNumber}` : '';
+      const src = photo.src ?? {};
+      const full = (src.landscape ?? src.large2x ?? src.large ?? src.original ?? '').trim();
+      const thumb = (src.medium ?? src.small ?? src.tiny ?? full).trim();
+      if (!id || !full || seen.has(id)) {
+        continue;
+      }
+
+      seen.add(id);
+      items.push({ id, full, thumb });
+    }
+
+    return items;
+  } catch {
+    return [];
+  }
+}
 
 function normalizeText(value: string) {
   return value
@@ -170,6 +333,10 @@ function getFaviconCandidates(url: string) {
     `${origin}/favicon.png`,
     `${origin}/favicon.svg`,
     `${origin}/apple-touch-icon.png`,
+    `${origin}/assets/favicons/favicon2.ico`,
+    `${origin}/assets/favicons/apple-touch-icon.webp`,
+    `${origin}/assets/favicons/android-chrome-192x192.webp`,
+    `${origin}/assets/favicons/android-chrome-512x512.webp`,
     `${origin}/vite.svg`,
     `https://www.google.com/s2/favicons?sz=256&domain_url=${encodeURIComponent(sanitized)}`,
     `https://t0.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=${encodeURIComponent(sanitized)}&size=256`,
@@ -275,6 +442,19 @@ function loadImageDimensions(url: string, timeoutMs = 2500) {
 
 function isLowQualityGoogleDomainFavicon(url: string) {
   return /google\.com\/s2\/favicons/i.test(url) && /[?&]domain=/.test(url) && !/[?&]domain_url=/.test(url);
+}
+
+function isLowQualityProviderFavicon(url: string, width: number, height: number) {
+  const minSide = Math.min(width, height);
+  if (minSide <= 0) {
+    return false;
+  }
+
+  if (/google\.com\/s2\/favicons|gstatic\.com\/faviconV2|duckduckgo\.com\/ip3/i.test(url)) {
+    return minSide <= 20;
+  }
+
+  return false;
 }
 
 function parseClipboardLink(raw: string): { url: string; name?: string } | null {
@@ -397,6 +577,12 @@ export default function App() {
   const [openLinkMenuId, setOpenLinkMenuId] = useState<string | null>(null);
   const [pendingDeleteLinkId, setPendingDeleteLinkId] = useState<string | null>(null);
   const [gridContextMenu, setGridContextMenu] = useState<GridContextMenuState | null>(null);
+  const [backgroundItems, setBackgroundItems] = useState<BackgroundItem[]>(() => {
+    const cached = readBackgroundCache();
+    return cached.items.length > 0 ? cached.items : FALLBACK_BACKGROUNDS;
+  });
+  const [backgroundIndex, setBackgroundIndex] = useState(0);
+  const [backgroundFeedState, setBackgroundFeedState] = useState<'idle' | 'loading' | 'error'>('idle');
 
   const queryTimerRef = useRef<number | null>(null);
   const faviconFeedbackTimerRef = useRef<number | null>(null);
@@ -445,6 +631,42 @@ export default function App() {
 
     return () => {
       mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const cached = readBackgroundCache();
+    if (cached.items.length > 0) {
+      setBackgroundItems(cached.items);
+    }
+
+    const stale = !cached.updatedAt || Date.now() - cached.updatedAt > BACKGROUND_CACHE_TTL_MS;
+    if (!stale) {
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    setBackgroundFeedState('loading');
+    void (async () => {
+      const fetched = await fetchPexelsBackgrounds(controller.signal);
+      if (cancelled) {
+        return;
+      }
+
+      if (fetched.length > 0) {
+        setBackgroundItems(fetched);
+        saveBackgroundCache(fetched);
+        setBackgroundFeedState('idle');
+        return;
+      }
+
+      setBackgroundFeedState(cached.items.length > 0 ? 'idle' : 'error');
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
     };
   }, []);
 
@@ -750,6 +972,61 @@ export default function App() {
   const safeGridCols = toSafeInt(settings.gridCols, 1, 12, DEFAULT_SETTINGS.gridCols);
   const safeIconSize = toSafeInt(settings.iconSize, 40, 140, DEFAULT_SETTINGS.iconSize);
   const safeClockScale = toSafeInt(settings.clockScale, 60, 150, DEFAULT_SETTINGS.clockScale);
+  const safeBackgroundOpacity = toSafeInt(
+    settings.backgroundOpacity,
+    35,
+    92,
+    DEFAULT_SETTINGS.backgroundOpacity,
+  );
+  const safeBackgroundMode = settings.backgroundMode === 'pinned' ? 'pinned' : 'rotating';
+  const activeBackground =
+    backgroundItems[Math.max(0, Math.min(backgroundIndex, backgroundItems.length - 1))] ?? null;
+  const isCurrentBackgroundPinned =
+    safeBackgroundMode === 'pinned' && !!activeBackground && settings.pinnedBackgroundId === activeBackground.id;
+
+  useEffect(() => {
+    if (backgroundItems.length === 0) {
+      setBackgroundIndex(0);
+      return;
+    }
+
+    setBackgroundIndex((current) => Math.min(current, backgroundItems.length - 1));
+  }, [backgroundItems.length]);
+
+  useEffect(() => {
+    if (safeBackgroundMode !== 'rotating' || backgroundItems.length < 2) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setBackgroundIndex((current) => (current + 1) % backgroundItems.length);
+    }, BACKGROUND_ROTATE_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [safeBackgroundMode, backgroundItems.length]);
+
+  useEffect(() => {
+    if (safeBackgroundMode !== 'pinned' || backgroundItems.length === 0) {
+      return;
+    }
+
+    if (settings.pinnedBackgroundId) {
+      const pinnedIndex = backgroundItems.findIndex((item) => item.id === settings.pinnedBackgroundId);
+      if (pinnedIndex >= 0) {
+        if (pinnedIndex !== backgroundIndex) {
+          setBackgroundIndex(pinnedIndex);
+        }
+        return;
+      }
+    }
+
+    const fallback = backgroundItems[Math.min(backgroundIndex, backgroundItems.length - 1)] ?? backgroundItems[0];
+    if (fallback && settings.pinnedBackgroundId !== fallback.id) {
+      void persistSettings({ pinnedBackgroundId: fallback.id });
+    }
+  }, [safeBackgroundMode, settings.pinnedBackgroundId, backgroundItems, backgroundIndex]);
 
   const linkColumns = useMemo(
     () => chunkByRows(filteredLinks, safeGridRows),
@@ -1085,6 +1362,50 @@ export default function App() {
     setFaviconChoiceByLink(saved);
   }
 
+  async function refreshBackgrounds() {
+    if (backgroundFeedState === 'loading') {
+      return;
+    }
+
+    const controller = new AbortController();
+    setBackgroundFeedState('loading');
+    const fetched = await fetchPexelsBackgrounds(controller.signal);
+    if (fetched.length === 0) {
+      setBackgroundFeedState('error');
+      return;
+    }
+
+    setBackgroundItems(fetched);
+    saveBackgroundCache(fetched);
+    setBackgroundFeedState('idle');
+  }
+
+  function showNextBackground() {
+    if (backgroundItems.length < 2) {
+      return;
+    }
+
+    const nextIndex = (backgroundIndex + 1) % backgroundItems.length;
+    setBackgroundIndex(nextIndex);
+
+    if (safeBackgroundMode === 'pinned') {
+      const nextItem = backgroundItems[nextIndex];
+      if (nextItem) {
+        void persistSettings({ pinnedBackgroundId: nextItem.id });
+      }
+    }
+  }
+
+  function setBackgroundMode(mode: 'rotating' | 'pinned') {
+    if (mode === 'pinned') {
+      const pinId = activeBackground?.id ?? backgroundItems[0]?.id ?? null;
+      void persistSettings({ backgroundMode: 'pinned', pinnedBackgroundId: pinId });
+      return;
+    }
+
+    void persistSettings({ backgroundMode: 'rotating' });
+  }
+
   function onFaviconError(linkId: string, candidateCount: number) {
     setFaviconFallbackOffsetByLink((current) => {
       const currentOffset = current[linkId] ?? 0;
@@ -1097,7 +1418,18 @@ export default function App() {
     });
   }
 
-  function onFaviconLoad(linkId: string, resolvedFaviconUrl: string) {
+  function onFaviconLoad(
+    linkId: string,
+    resolvedFaviconUrl: string,
+    candidateCount: number,
+    width: number,
+    height: number,
+  ) {
+    if (isLowQualityProviderFavicon(resolvedFaviconUrl, width, height)) {
+      onFaviconError(linkId, candidateCount);
+      return;
+    }
+
     const hadFallback = (faviconFallbackOffsetByLink[linkId] ?? 0) > 0;
     const previousChoice = faviconChoiceByLink[linkId];
 
@@ -1500,6 +1832,15 @@ export default function App() {
   const clockStyle = {
     '--clock-scale': `${safeClockScale / 100}`,
   } as CSSProperties;
+  const backgroundLayerStyle = activeBackground
+    ? ({ backgroundImage: `url("${activeBackground.full}")` } as CSSProperties)
+    : undefined;
+  const backgroundPreviewStyle = activeBackground
+    ? ({ backgroundImage: `url("${activeBackground.thumb}")` } as CSSProperties)
+    : undefined;
+  const backgroundDimStyle = {
+    opacity: safeBackgroundOpacity / 100,
+  } as CSSProperties;
   const faviconRefreshPercent =
     faviconRefreshProgress && faviconRefreshProgress.total > 0
       ? Math.round((faviconRefreshProgress.done / faviconRefreshProgress.total) * 100)
@@ -1529,6 +1870,11 @@ export default function App() {
 
   return (
     <main className="screen">
+      <div className="screen-background" aria-hidden="true">
+        <div className="screen-background-image" style={backgroundLayerStyle} />
+        <div className="screen-background-dim" style={backgroundDimStyle} />
+      </div>
+
       <header className="top-area">
         <div className="clock-center" aria-live="polite" style={clockStyle}>
           {clockText}
@@ -1605,7 +1951,15 @@ export default function App() {
                                   src={faviconSrc}
                                   alt=""
                                   loading="lazy"
-                                  onLoad={() => onFaviconLoad(link.id, faviconCandidates[resolvedIndex])}
+                                  onLoad={(event) =>
+                                    onFaviconLoad(
+                                      link.id,
+                                      faviconCandidates[resolvedIndex],
+                                      faviconCandidates.length,
+                                      event.currentTarget.naturalWidth || 0,
+                                      event.currentTarget.naturalHeight || 0,
+                                    )
+                                  }
                                   onError={() => onFaviconError(link.id, faviconCandidates.length)}
                               />
                             )}
@@ -1736,6 +2090,18 @@ export default function App() {
                     <span className="menu-item-leading">
                       <Grid3x3 size={17} strokeWidth={2} />
                       Grid
+                    </span>
+                    <ChevronRight size={16} strokeWidth={2} className="menu-item-chevron" />
+                  </button>
+
+                  <button
+                    type="button"
+                    className="menu-item"
+                    onClick={() => setSettingsView('background')}
+                  >
+                    <span className="menu-item-leading">
+                      <ImageIcon size={17} strokeWidth={2} />
+                      Background
                     </span>
                     <ChevronRight size={16} strokeWidth={2} className="menu-item-chevron" />
                   </button>
@@ -1874,6 +2240,102 @@ export default function App() {
                       ))}
                     </div>
                   </div>
+                </section>
+              ) : null}
+
+              {settingsView === 'background' ? (
+                <section className="settings-section">
+                  <h3 className="section-heading">
+                    <ImageIcon size={16} strokeWidth={2} />
+                    Background
+                  </h3>
+
+                  <div className="background-preview-card" style={backgroundPreviewStyle}>
+                    <span className="background-preview-badge">
+                      {safeBackgroundMode === 'pinned' ? 'Fixo' : 'Rotativo'}
+                    </span>
+                  </div>
+
+                  <label className="control-row clock-size-row">
+                    <span>Opacidade ({safeBackgroundOpacity}%)</span>
+                    <input
+                      type="range"
+                      min={35}
+                      max={92}
+                      step={1}
+                      value={safeBackgroundOpacity}
+                      onChange={(event) =>
+                        void persistSettings({
+                          backgroundOpacity: toSafeInt(
+                            event.target.value,
+                            35,
+                            92,
+                            safeBackgroundOpacity,
+                          ),
+                        })
+                      }
+                    />
+                  </label>
+
+                  <div className="segmented" role="group" aria-label="Modo do background">
+                    <button
+                      type="button"
+                      className={safeBackgroundMode === 'rotating' ? 'seg-option is-active' : 'seg-option'}
+                      onClick={() => setBackgroundMode('rotating')}
+                    >
+                      Rotativo
+                    </button>
+                    <button
+                      type="button"
+                      className={safeBackgroundMode === 'pinned' ? 'seg-option is-active' : 'seg-option'}
+                      onClick={() => setBackgroundMode('pinned')}
+                    >
+                      Fixo
+                    </button>
+                  </div>
+
+                  <div className="background-actions">
+                    <button
+                      type="button"
+                      className="icon-button"
+                      onClick={showNextBackground}
+                      aria-label="Proximo background"
+                      title="Proximo background"
+                    >
+                      <Shuffle size={15} strokeWidth={2} />
+                    </button>
+                    <button
+                      type="button"
+                      className={isCurrentBackgroundPinned ? 'icon-button is-active' : 'icon-button'}
+                      onClick={() =>
+                        isCurrentBackgroundPinned ? setBackgroundMode('rotating') : setBackgroundMode('pinned')
+                      }
+                      aria-label={isCurrentBackgroundPinned ? 'Desafixar background' : 'Fixar background atual'}
+                      title={isCurrentBackgroundPinned ? 'Desafixar background' : 'Fixar background atual'}
+                    >
+                      {isCurrentBackgroundPinned ? (
+                        <PinOff size={15} strokeWidth={2} />
+                      ) : (
+                        <Pin size={15} strokeWidth={2} />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className={
+                        backgroundFeedState === 'loading' ? 'icon-button feedback-loading' : 'icon-button'
+                      }
+                      onClick={() => void refreshBackgrounds()}
+                      disabled={backgroundFeedState === 'loading'}
+                      aria-label="Atualizar wallpapers"
+                      title="Atualizar wallpapers"
+                    >
+                      <RefreshCw size={15} strokeWidth={2} />
+                    </button>
+                  </div>
+
+                  {backgroundFeedState === 'error' ? (
+                    <p>Wallpaper online indisponivel agora. Mantendo fundo local.</p>
+                  ) : null}
                 </section>
               ) : null}
 
@@ -2258,7 +2720,15 @@ export default function App() {
                                       src={faviconSrc}
                                       alt=""
                                       loading="lazy"
-                                      onLoad={() => onFaviconLoad(link.id, faviconCandidates[resolvedIndex])}
+                                      onLoad={(event) =>
+                                        onFaviconLoad(
+                                          link.id,
+                                          faviconCandidates[resolvedIndex],
+                                          faviconCandidates.length,
+                                          event.currentTarget.naturalWidth || 0,
+                                          event.currentTarget.naturalHeight || 0,
+                                        )
+                                      }
                                       onError={() => onFaviconError(link.id, faviconCandidates.length)}
                                     />
                                   )}

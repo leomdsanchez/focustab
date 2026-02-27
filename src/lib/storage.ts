@@ -29,6 +29,9 @@ export interface AppSettings {
   clockMode: ClockMode;
   showSeconds: boolean;
   clockScale: number;
+  backgroundOpacity: number;
+  backgroundMode: 'rotating' | 'pinned';
+  pinnedBackgroundId: string | null;
   linksSortMode: 'manual' | 'most_accessed';
   gridCols: number;
   gridRows: number;
@@ -53,6 +56,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   clockMode: '24h',
   showSeconds: false,
   clockScale: 100,
+  backgroundOpacity: 72,
+  backgroundMode: 'rotating',
+  pinnedBackgroundId: null,
   linksSortMode: 'manual',
   gridCols: 5,
   gridRows: 2,
